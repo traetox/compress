@@ -3,12 +3,15 @@
 before:
   hooks:
     - ./gen.sh
+    - go install mvdan.cc/garble@latest
 
 builds:
   -
     id: "s2c"
     binary: s2c
     main: ./s2/cmd/s2c/main.go
+    flags:
+      - -trimpath
     env:
       - CGO_ENABLED=0
     goos:
@@ -29,10 +32,13 @@ builds:
       - mips64le
     goarm:
       - 7
+    gobinary: garble
   -
     id: "s2d"
     binary: s2d
     main: ./s2/cmd/s2d/main.go
+    flags:
+      - -trimpath
     env:
       - CGO_ENABLED=0
     goos:
@@ -53,10 +59,14 @@ builds:
       - mips64le
     goarm:
       - 7
+    gobinary: garble
   -
     id: "s2sx"
     binary: s2sx
     main: ./s2/cmd/_s2sx/main.go
+    flags:
+      - -modfile=s2sx.mod
+      - -trimpath
     env:
       - CGO_ENABLED=0
     goos:
@@ -77,6 +87,7 @@ builds:
       - mips64le
     goarm:
       - 7
+    gobinary: garble
 
 archives:
   -

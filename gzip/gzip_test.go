@@ -7,10 +7,11 @@ package gzip
 import (
 	"bufio"
 	"bytes"
-	oldgz "compress/gzip"
 	"io"
 	"io/ioutil"
 	"math/rand"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -212,6 +213,9 @@ func TestConcat(t *testing.T) {
 	w.Close()
 
 	r, err := NewReader(&buf)
+	if err != nil {
+		t.Fatal(err)
+	}
 	data, err := ioutil.ReadAll(r)
 	if string(data) != "hello world\n" || err != nil {
 		t.Fatalf("ReadAll = %q, %v, want %q, nil", data, err, "hello world")
@@ -440,7 +444,7 @@ func testDeterm(i int, t *testing.T) {
 	b1b := b1.Bytes()
 	b2b := b2.Bytes()
 
-	if bytes.Compare(b1b, b2b) != 0 {
+	if !bytes.Equal(b1b, b2b) {
 		t.Fatalf("Level %d did not produce deterministric result, len(a) = %d, len(b) = %d", i, len(b1b), len(b2b))
 	}
 }
@@ -483,6 +487,7 @@ func benchmarkGzipN(b *testing.B, level int) {
 	}
 }
 
+/*
 func BenchmarkOldGzipL1(b *testing.B) { benchmarkOldGzipN(b, 1) }
 func BenchmarkOldGzipL2(b *testing.B) { benchmarkOldGzipN(b, 2) }
 func BenchmarkOldGzipL3(b *testing.B) { benchmarkOldGzipN(b, 3) }
@@ -518,4 +523,44 @@ func benchmarkOldGzipN(b *testing.B, level int) {
 			panic(err)
 		}
 	}
+}
+
+*/
+
+func BenchmarkCompressAllocations(b *testing.B) {
+	payload := []byte(strings.Repeat("Tiny payload", 20))
+	for j := -2; j <= 9; j++ {
+		b.Run("level("+strconv.Itoa(j)+")", func(b *testing.B) {
+			b.Run("gzip", func(b *testing.B) {
+				b.ReportAllocs()
+
+				for i := 0; i < b.N; i++ {
+					w, err := NewWriterLevel(ioutil.Discard, j)
+					if err != nil {
+						b.Fatal(err)
+					}
+					w.Write(payload)
+					w.Close()
+				}
+			})
+		})
+	}
+}
+
+func BenchmarkCompressAllocationsSingle(b *testing.B) {
+	payload := []byte(strings.Repeat("Tiny payload", 20))
+	const level = 2
+
+	b.Run("gzip", func(b *testing.B) {
+		b.ReportAllocs()
+
+		for i := 0; i < b.N; i++ {
+			w, err := NewWriterLevel(ioutil.Discard, level)
+			if err != nil {
+				b.Fatal(err)
+			}
+			w.Write(payload)
+			w.Close()
+		}
+	})
 }

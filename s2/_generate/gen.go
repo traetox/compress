@@ -1,8 +1,11 @@
 package main
 
 //go:generate go run gen.go -out ../encodeblock_amd64.s -stubs ../encodeblock_amd64.go -pkg=s2
+//go:generate gofmt -w ../encodeblock_amd64.go
+//go:generate go run cleanup.go ../encodeblock_amd64.s
 
 import (
+	"flag"
 	"fmt"
 	"math"
 	"runtime"
@@ -27,12 +30,17 @@ const (
 )
 
 func main() {
+	flag.Parse()
 	Constraint(buildtags.Not("appengine").ToConstraint())
 	Constraint(buildtags.Not("noasm").ToConstraint())
 	Constraint(buildtags.Term("gc").ToConstraint())
+	Constraint(buildtags.Not("noasm").ToConstraint())
 
 	o := options{
-		snappy: false,
+		bmi1:         false,
+		bmi2:         false,
+		snappy:       false,
+		outputMargin: 9,
 	}
 	o.genEncodeBlockAsm("encodeBlockAsm", 14, 6, 6, limit14B)
 	o.genEncodeBlockAsm("encodeBlockAsm4MB", 14, 6, 6, 4<<20)
@@ -40,20 +48,34 @@ func main() {
 	o.genEncodeBlockAsm("encodeBlockAsm10B", 10, 5, 4, limit10B)
 	o.genEncodeBlockAsm("encodeBlockAsm8B", 8, 4, 4, limit8B)
 
+	o.outputMargin = 6
+	o.maxSkip = 100 // Blocks can be long, limit max skipping.
 	o.genEncodeBetterBlockAsm("encodeBetterBlockAsm", 16, 7, 7, limit14B)
 	o.genEncodeBetterBlockAsm("encodeBetterBlockAsm4MB", 16, 7, 7, 4<<20)
+	o.maxSkip = 0
 	o.genEncodeBetterBlockAsm("encodeBetterBlockAsm12B", 14, 6, 6, limit12B)
 	o.genEncodeBetterBlockAsm("encodeBetterBlockAsm10B", 12, 5, 6, limit10B)
 	o.genEncodeBetterBlockAsm("encodeBetterBlockAsm8B", 10, 4, 6, limit8B)
 
 	// Snappy compatible
 	o.snappy = true
+	o.outputMargin = 9
 	o.genEncodeBlockAsm("encodeSnappyBlockAsm", 14, 6, 6, limit14B)
+	o.genEncodeBlockAsm("encodeSnappyBlockAsm64K", 14, 6, 6, 64<<10-1)
 	o.genEncodeBlockAsm("encodeSnappyBlockAsm12B", 12, 5, 5, limit12B)
 	o.genEncodeBlockAsm("encodeSnappyBlockAsm10B", 10, 5, 4, limit10B)
 	o.genEncodeBlockAsm("encodeSnappyBlockAsm8B", 8, 4, 4, limit8B)
 
+	o.maxSkip = 100
+	o.genEncodeBetterBlockAsm("encodeSnappyBetterBlockAsm", 16, 7, 7, limit14B)
+	o.maxSkip = 0
+	o.genEncodeBetterBlockAsm("encodeSnappyBetterBlockAsm64K", 16, 7, 7, 64<<10-1)
+	o.genEncodeBetterBlockAsm("encodeSnappyBetterBlockAsm12B", 14, 6, 6, limit12B)
+	o.genEncodeBetterBlockAsm("encodeSnappyBetterBlockAsm10B", 12, 5, 6, limit10B)
+	o.genEncodeBetterBlockAsm("encodeSnappyBetterBlockAsm8B", 10, 4, 6, limit8B)
+
 	o.snappy = false
+	o.outputMargin = 0
 	o.maxLen = math.MaxUint32
 	o.genEmitLiteral()
 	o.genEmitRepeat()
@@ -98,9 +120,12 @@ func assert(fn func(ok LabelRef)) {
 }
 
 type options struct {
-	snappy bool
-	vmbi2  bool
-	maxLen int
+	snappy       bool
+	bmi1         bool
+	bmi2         bool
+	maxLen       int
+	outputMargin int // Should be at least 5.
+	maxSkip      int
 }
 
 func (o options) genEncodeBlockAsm(name string, tableBits, skipLog, hashBytes, maxLen int) {
@@ -190,7 +215,7 @@ func (o options) genEncodeBlockAsm(name string, tableBits, skipLog, hashBytes, m
 		const inputMargin = 8
 		tmp, tmp2, tmp3 := GP64(), GP64(), GP64()
 		MOVQ(lenSrcQ, tmp)
-		LEAQ(Mem{Base: tmp, Disp: -5}, tmp2)
+		LEAQ(Mem{Base: tmp, Disp: -o.outputMargin}, tmp2)
 		// sLimitL := len(src) - inputMargin
 		LEAQ(Mem{Base: tmp, Disp: -inputMargin}, tmp3)
 
@@ -201,12 +226,12 @@ func (o options) genEncodeBlockAsm(name string, tableBits, skipLog, hashBytes, m
 
 		MOVL(tmp3.As32(), sLimitL)
 
-		// dstLimit := (len(src) - 5 ) - len(src)>>5
+		// dstLimit := (len(src) - outputMargin ) - len(src)>>5
 		SHRQ(U8(5), tmp)
 		SUBL(tmp.As32(), tmp2.As32()) // tmp2 = tmp2 - tmp
 
 		assert(func(ok LabelRef) {
-			// if len(src) > len(src) - len(src)>>5 - 5: ok
+			// if len(src) > len(src) - len(src)>>5 - outputMargin: ok
 			CMPQ(lenSrcQ, tmp2)
 			JGE(ok)
 		})
@@ -237,10 +262,9 @@ func (o options) genEncodeBlockAsm(name string, tableBits, skipLog, hashBytes, m
 		})
 
 		cv := GP64()
-		MOVQ(Mem{Base: src, Index: s, Scale: 1}, cv)
 		nextS := GP32()
 		// nextS := s + (s-nextEmit)>>6 + 4
-		{
+		if o.maxSkip == 0 {
 			tmp := GP64()
 			MOVL(s, tmp.As32())           // tmp = s
 			SUBL(nextEmitL, tmp.As32())   // tmp = s - nextEmit
@@ -252,6 +276,7 @@ func (o options) genEncodeBlockAsm(name string, tableBits, skipLog, hashBytes, m
 			CMPL(nextS.As32(), sLimitL)
 			JGE(LabelRef("emit_remainder_" + name))
 		}
+		MOVQ(Mem{Base: src, Index: s, Scale: 1}, cv)
 		assert(func(ok LabelRef) {
 			// Check if s is valid (we should have jumped above if not)
 			tmp := GP64()
@@ -841,7 +866,7 @@ func (o options) genEncodeBetterBlockAsm(name string, lTableBits, skipLog, lHash
 		const inputMargin = 8
 		tmp, tmp2, tmp3 := GP64(), GP64(), GP64()
 		MOVQ(lenSrcQ, tmp)
-		LEAQ(Mem{Base: tmp, Disp: -6}, tmp2)
+		LEAQ(Mem{Base: tmp, Disp: -o.outputMargin}, tmp2)
 		// sLimitL := len(src) - inputMargin
 		LEAQ(Mem{Base: tmp, Disp: -inputMargin}, tmp3)
 
@@ -888,21 +913,42 @@ func (o options) genEncodeBetterBlockAsm(name string, lTableBits, skipLog, lHash
 		})
 
 		cv := GP64()
-		MOVQ(Mem{Base: src, Index: s, Scale: 1}, cv)
 		nextS := GP32()
 		// nextS := s + (s-nextEmit)>>skipLog + 1
-		{
+		if o.maxSkip == 0 {
 			tmp := GP64()
 			MOVL(s, tmp.As32())           // tmp = s
 			SUBL(nextEmitL, tmp.As32())   // tmp = s - nextEmit
 			SHRL(U8(skipLog), tmp.As32()) // tmp = (s - nextEmit) >> skipLog
 			LEAL(Mem{Base: s, Disp: 1, Index: tmp, Scale: 1}, nextS)
+		} else {
+			/*
+				nextS = (s-nextEmit)>>7 + 1
+				if nextS > maxSkip {
+					nextS = s + maxSkip
+				} else {
+					nextS += s
+				}
+			*/
+			tmp := GP64()
+			MOVL(s, tmp.As32())           // tmp = s
+			SUBL(nextEmitL, tmp.As32())   // tmp = s - nextEmit
+			SHRL(U8(skipLog), tmp.As32()) // tmp = (s - nextEmit) >> skipLog
+			CMPL(tmp.As32(), U8(o.maxSkip-1))
+			JLE(LabelRef("check_maxskip_ok_" + name))
+			LEAL(Mem{Base: s, Disp: o.maxSkip, Scale: 1}, nextS)
+			JMP(LabelRef("check_maxskip_cont_" + name))
+
+			Label("check_maxskip_ok_" + name)
+			LEAL(Mem{Base: s, Disp: 1, Index: tmp, Scale: 1}, nextS)
+			Label("check_maxskip_cont_" + name)
 		}
 		// if nextS > sLimit {goto emitRemainder}
 		{
 			CMPL(nextS.As32(), sLimitL)
 			JGE(LabelRef("emit_remainder_" + name))
 		}
+		MOVQ(Mem{Base: src, Index: s, Scale: 1}, cv)
 		assert(func(ok LabelRef) {
 			// Check if s is valid (we should have jumped above if not)
 			tmp := GP64()
@@ -1210,8 +1256,10 @@ func (o options) genEncodeBetterBlockAsm(name string, lTableBits, skipLog, lHash
 			MOVL(s, offset32)
 			SUBL(candidate, offset32)
 			Comment("Check if repeat")
-			CMPL(repeatL, offset32)
-			JEQ(LabelRef("match_is_repeat_" + name))
+			if !o.snappy {
+				CMPL(repeatL, offset32)
+				JEQ(LabelRef("match_is_repeat_" + name))
+			}
 
 			// NOT REPEAT
 			{
@@ -1241,7 +1289,7 @@ func (o options) genEncodeBetterBlockAsm(name string, lTableBits, skipLog, lHash
 				// Jumps at end
 			}
 			// REPEAT
-			{
+			if !o.snappy {
 				Label("match_is_repeat_" + name)
 				// Emit....
 				o.emitLiteralsDstP(nextEmitL, base, src, dst, "match_emit_repeat_"+name)
@@ -1284,40 +1332,62 @@ func (o options) genEncodeBetterBlockAsm(name string, lTableBits, skipLog, lHash
 		cv := GP64()
 		INCL(base)
 		MOVQ(Mem{Base: src, Index: base, Scale: 1, Disp: 0}, cv)
-		hash0, hash1 := GP64(), GP64()
+		hash0, hash1, hash2, hash3 := GP64(), GP64(), GP64(), GP64()
 		MOVQ(cv, hash0) // src[base+1]
 		MOVQ(cv, hash1)
+		MOVQ(cv, hash2)
 		SHRQ(U8(8), hash1) // src[base+2]
-		bp1 := GP32()      // base+1
+		MOVQ(hash1, hash3)
+		SHRQ(U8(16), hash2)        // src[base+3]
+		bp1, bp2 := GP32(), GP32() // base+1
 		LEAL(Mem{Base: base, Disp: 1}, bp1)
+		LEAL(Mem{Base: base, Disp: 2}, bp2)
 
 		// Load s-2 early
 		MOVQ(Mem{Base: src, Index: s, Scale: 1, Disp: -2}, cv)
 
 		lHasher.hash(hash0)
+		lHasher.hash(hash3)
 		sHasher.hash(hash1)
+		sHasher.hash(hash2)
 		assert(func(ok LabelRef) {
 			CMPQ(hash0, U32(lTableSize))
+			JL(ok)
+		})
+		assert(func(ok LabelRef) {
+			CMPQ(hash3, U32(lTableSize))
 			JL(ok)
 		})
 		assert(func(ok LabelRef) {
 			CMPQ(hash1, U32(sTableSize))
 			JL(ok)
 		})
+		assert(func(ok LabelRef) {
+			CMPQ(hash2, U32(sTableSize))
+			JL(ok)
+		})
 		MOVL(base, lTab.Idx(hash0, 4))
+		MOVL(bp1, lTab.Idx(hash3, 4))
 		MOVL(bp1, sTab.Idx(hash1, 4))
+		MOVL(bp2, sTab.Idx(hash2, 4))
 
-		// Index s-2 long, s-1 short...
+		// Index s-2 long, s-1 long+short...
 		MOVQ(cv, hash0) // src[s-2]
 		MOVQ(cv, hash1) // src[s-1]
 		SHRQ(U8(8), hash1)
+		MOVQ(hash1, hash3)
 		sm1, sm2 := GP32(), GP32() // s -1, s - 2
 		LEAL(Mem{Base: s, Disp: -2}, sm2)
 		LEAL(Mem{Base: s, Disp: -1}, sm1)
 		lHasher.hash(hash0)
 		sHasher.hash(hash1)
+		lHasher.hash(hash3)
 		assert(func(ok LabelRef) {
 			CMPQ(hash0, U32(lTableSize))
+			JL(ok)
+		})
+		assert(func(ok LabelRef) {
+			CMPQ(hash3, U32(lTableSize))
 			JL(ok)
 		})
 		assert(func(ok LabelRef) {
@@ -1326,6 +1396,7 @@ func (o options) genEncodeBetterBlockAsm(name string, lTableBits, skipLog, lHash
 		})
 		MOVL(sm2, lTab.Idx(hash0, 4))
 		MOVL(sm1, sTab.Idx(hash1, 4))
+		MOVL(sm1, lTab.Idx(hash3, 4))
 	}
 	JMP(LabelRef("search_loop_" + name))
 
@@ -1487,8 +1558,12 @@ func (h hashGen) hash(val reg.GPVirtual) {
 	if h.bytes < 8 {
 		SHLQ(U8(64-8*h.bytes), val)
 	}
+	//  329 AMD64               :IMUL r64, r64                         L:   0.86ns=  3.0c  T:   0.29ns=  1.00c
+	// 2020 BMI2                :MULX r64, r64, r64                    L:   1.14ns=  4.0c  T:   0.29ns=  1.00c
 	IMULQ(h.mulreg, val)
 	// Move value to bottom
+	// 2032 BMI2                :SHRX r64, r64, r64                    L:   0.29ns=  1.0c  T:   0.12ns=  0.42c
+	//  236 AMD64               :SHR r64, imm8                         L:   0.29ns=  1.0c  T:   0.13ns=  0.46c
 	SHRQ(U8(64-h.tablebits), val)
 }
 
@@ -1496,7 +1571,7 @@ func (o options) genEmitLiteral() {
 	TEXT("emitLiteral", NOSPLIT, "func(dst, lit []byte) int")
 	Doc("emitLiteral writes a literal chunk and returns the number of bytes written.", "",
 		"It assumes that:",
-		"  dst is long enough to hold the encoded bytes",
+		fmt.Sprintf("  dst is long enough to hold the encoded bytes with margin of %d bytes", o.outputMargin),
 		"  0 <= len(lit) && len(lit) <= math.MaxUint32", "")
 	Pragma("noescape")
 
@@ -1624,8 +1699,11 @@ func (o options) emitLiteral(name string, litLen, retval, dstBase, litBase reg.G
 	length := GP64()
 	MOVL(litLen.As32(), length.As32())
 
+	// We wrote one byte, we have that less in output margin.
+	o.outputMargin--
 	// updates litBase.
 	o.genMemMoveShort("emit_lit_memmove_"+name, dstBase, litBase, length, copyEnd)
+	o.outputMargin++
 
 	if updateDst {
 		Label("memmove_end_copy_" + name)
@@ -1827,7 +1905,6 @@ func (o options) genEmitCopy() {
 
 	//	i := 0
 	XORQ(retval, retval)
-
 	Load(Param("dst").Base(), dstBase)
 	Load(Param("offset"), offset)
 	Load(Param("length"), length)
@@ -2045,12 +2122,22 @@ func (o options) genMemMoveShort(name string, dst, src, length reg.GPVirtual, en
 		TESTQ(length, length)
 		JNZ(ok)
 	})
-	Label(name + "tail")
-	CMPQ(length, U8(3))
-	JB(LabelRef(name + "move_1or2"))
-	JE(LabelRef(name + "move_3"))
-	CMPQ(length, U8(8))
-	JB(LabelRef(name + "move_4through7"))
+
+	if o.outputMargin <= 3 {
+		CMPQ(length, U8(3))
+		JB(LabelRef(name + "move_1or2"))
+		JE(LabelRef(name + "move_3"))
+	} else if o.outputMargin >= 4 && o.outputMargin < 8 {
+		CMPQ(length, U8(4))
+		JLE(LabelRef(name + "move_4"))
+	}
+	if o.outputMargin <= 7 {
+		CMPQ(length, U8(8))
+		JB(LabelRef(name + "move_4through7"))
+	} else if o.outputMargin >= 8 {
+		CMPQ(length, U8(8))
+		JLE(LabelRef(name + "move_8"))
+	}
 	CMPQ(length, U8(16))
 	JBE(LabelRef(name + "move_8through16"))
 	CMPQ(length, U8(32))
@@ -2064,26 +2151,43 @@ func (o options) genMemMoveShort(name string, dst, src, length reg.GPVirtual, en
 
 	//genMemMoveLong(name, dst, src, length, end)
 
-	Label(name + "move_1or2")
-	MOVB(Mem{Base: src}, AX.As8())
-	MOVB(Mem{Base: src, Disp: -1, Index: length, Scale: 1}, CX.As8())
-	MOVB(AX.As8(), Mem{Base: dst})
-	MOVB(CX.As8(), Mem{Base: dst, Disp: -1, Index: length, Scale: 1})
-	JMP(end)
+	if o.outputMargin <= 3 {
+		Label(name + "move_1or2")
+		MOVB(Mem{Base: src}, AX.As8())
+		MOVB(Mem{Base: src, Disp: -1, Index: length, Scale: 1}, CX.As8())
+		MOVB(AX.As8(), Mem{Base: dst})
+		MOVB(CX.As8(), Mem{Base: dst, Disp: -1, Index: length, Scale: 1})
+		JMP(end)
 
-	Label(name + "move_3")
-	MOVW(Mem{Base: src}, AX.As16())
-	MOVB(Mem{Base: src, Disp: 2}, CX.As8())
-	MOVW(AX.As16(), Mem{Base: dst})
-	MOVB(CX.As8(), Mem{Base: dst, Disp: 2})
-	JMP(end)
+		Label(name + "move_3")
+		MOVW(Mem{Base: src}, AX.As16())
+		MOVB(Mem{Base: src, Disp: 2}, CX.As8())
+		MOVW(AX.As16(), Mem{Base: dst})
+		MOVB(CX.As8(), Mem{Base: dst, Disp: 2})
+		JMP(end)
+	}
 
-	Label(name + "move_4through7")
-	MOVL(Mem{Base: src}, AX.As32())
-	MOVL(Mem{Base: src, Disp: -4, Index: length, Scale: 1}, CX.As32())
-	MOVL(AX.As32(), Mem{Base: dst})
-	MOVL(CX.As32(), Mem{Base: dst, Disp: -4, Index: length, Scale: 1})
-	JMP(end)
+	if o.outputMargin >= 4 && o.outputMargin < 8 {
+		// Use single move.
+		Label(name + "move_4")
+		MOVL(Mem{Base: src}, AX.As32())
+		MOVL(AX.As32(), Mem{Base: dst})
+		JMP(end)
+	}
+	if o.outputMargin < 8 {
+		Label(name + "move_4through7")
+		MOVL(Mem{Base: src}, AX.As32())
+		MOVL(Mem{Base: src, Disp: -4, Index: length, Scale: 1}, CX.As32())
+		MOVL(AX.As32(), Mem{Base: dst})
+		MOVL(CX.As32(), Mem{Base: dst, Disp: -4, Index: length, Scale: 1})
+		JMP(end)
+	} else {
+		// Use single move.
+		Label(name + "move_8")
+		MOVQ(Mem{Base: src}, AX)
+		MOVQ(AX, Mem{Base: dst})
+		JMP(end)
+	}
 
 	Label(name + "move_8through16")
 	MOVQ(Mem{Base: src}, AX)
@@ -2390,7 +2494,7 @@ func (o options) matchLen(name string, a, b, len reg.GPVirtual, end LabelRef) re
 	XORL(matched, matched)
 
 	CMPL(len.As32(), U8(8))
-	JL(LabelRef("matchlen_single_" + name))
+	JL(LabelRef("matchlen_match4_" + name))
 
 	Label("matchlen_loopback_" + name)
 	MOVQ(Mem{Base: a, Index: matched, Scale: 1}, tmp)
@@ -2398,7 +2502,23 @@ func (o options) matchLen(name string, a, b, len reg.GPVirtual, end LabelRef) re
 	TESTQ(tmp, tmp)
 	JZ(LabelRef("matchlen_loop_" + name))
 	// Not all match.
+
+	Comment("#ifdef GOAMD64_v3")
+	// 2016 BMI                 :TZCNT r64, r64                        L:   0.57ns=  2.0c  T:   0.29ns=  1.00c
+	//  315 AMD64               :BSF r64, r64                          L:   0.88ns=  3.1c  T:   0.86ns=  3.00c
+	TZCNTQ(tmp, tmp)
+	Comment("#define TZCNTQ_EMITTED 1")
+	Comment("#endif\n")
+	Comment("#ifdef GOAMD64_v4")
+	TZCNTQ(tmp, tmp)
+	Comment("#define TZCNTQ_EMITTED 1")
+	Comment("#endif\n")
+	Comment("#ifdef TZCNTQ_EMITTED")
+	Comment("#undef TZCNTQ_EMITTED")
+	Comment("#else")
 	BSFQ(tmp, tmp)
+	Comment("#endif")
+
 	SARQ(U8(3), tmp)
 	LEAL(Mem{Base: matched, Index: tmp, Scale: 1}, matched)
 	JMP(end)
@@ -2409,18 +2529,37 @@ func (o options) matchLen(name string, a, b, len reg.GPVirtual, end LabelRef) re
 	LEAL(Mem{Base: matched, Disp: 8}, matched)
 	CMPL(len.As32(), U8(8))
 	JGE(LabelRef("matchlen_loopback_" + name))
+	JZ(end)
 
 	// Less than 8 bytes left.
-	Label("matchlen_single_" + name)
-	TESTL(len.As32(), len.As32())
-	JZ(end)
-	Label("matchlen_single_loopback_" + name)
+	// Test 4 bytes...
+	Label("matchlen_match4_" + name)
+	CMPL(len.As32(), U8(4))
+	JL(LabelRef("matchlen_match2_" + name))
+	MOVL(Mem{Base: a, Index: matched, Scale: 1}, tmp.As32())
+	CMPL(Mem{Base: b, Index: matched, Scale: 1}, tmp.As32())
+	JNE(LabelRef("matchlen_match2_" + name))
+	SUBL(U8(4), len.As32())
+	LEAL(Mem{Base: matched, Disp: 4}, matched)
+
+	// Test 2 bytes...
+	Label("matchlen_match2_" + name)
+	CMPL(len.As32(), U8(2))
+	JL(LabelRef("matchlen_match1_" + name))
+	MOVW(Mem{Base: a, Index: matched, Scale: 1}, tmp.As16())
+	CMPW(Mem{Base: b, Index: matched, Scale: 1}, tmp.As16())
+	JNE(LabelRef("matchlen_match1_" + name))
+	SUBL(U8(2), len.As32())
+	LEAL(Mem{Base: matched, Disp: 2}, matched)
+
+	// Test 1 byte...
+	Label("matchlen_match1_" + name)
+	CMPL(len.As32(), U8(1))
+	JL(end)
 	MOVB(Mem{Base: a, Index: matched, Scale: 1}, tmp.As8())
 	CMPB(Mem{Base: b, Index: matched, Scale: 1}, tmp.As8())
 	JNE(end)
 	LEAL(Mem{Base: matched, Disp: 1}, matched)
-	DECL(len.As32())
-	JNZ(LabelRef("matchlen_single_loopback_" + name))
 	JMP(end)
 	return matched
 }

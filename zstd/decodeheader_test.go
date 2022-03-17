@@ -82,7 +82,7 @@ func TestHeader_Decode(t *testing.T) {
 				t.Errorf("want error, got result: %v", got)
 			}
 			if want != got {
-				t.Errorf("want %#v, got %#v", want, got)
+				t.Errorf("header mismatch:\nwant %#v\ngot  %#v", want, got)
 			}
 		})
 	}
@@ -93,6 +93,9 @@ func TestHeader_Decode(t *testing.T) {
 		}
 		defer w.Close()
 		enc, err := NewWriter(w, WithEncoderLevel(SpeedBestCompression))
+		if err != nil {
+			t.Fatal(err)
+		}
 		b, err := json.Marshal(golden)
 		if err != nil {
 			t.Fatal(err)
@@ -100,6 +103,5 @@ func TestHeader_Decode(t *testing.T) {
 		enc.ReadFrom(bytes.NewBuffer(b))
 		enc.Close()
 		t.SkipNow()
-		return
 	}
 }
